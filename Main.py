@@ -1,13 +1,20 @@
 import customtkinter as ctk
 import importlib 
 import datetime  
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from classes.Database import engine as db_engine, get_session
 from ai import StoryGPT
 from PIL import Image 
 from tkinter import messagebox
 import pickle, os
 from classes.models import User
+from classes.user_service import get_user_by_username
+from config import (
+    PROJECT_ROOT, 
+    ICON_FILE, 
+    IMAGES_SUBDIRECTORY, 
+    THEME_COLORS, 
+    LAST_USER_PICKLE_FILE
+)
 
 
 '''
@@ -179,6 +186,19 @@ Methods:
 - logoutUser(self): Logs out the currently logged in user from our application.
 '''
 
+# SECURITY NOTE: The UserSessionManager uses Python's `pickle` module to store the last logged-in
+# user's username in 'last_user.pkl'. While this approach is convenient for a local desktop
+# application to remember the last user, it's important to be aware of the security implications
+# of `pickle`. Deserializing pickle files from untrusted sources can be dangerous and may lead to
+# arbitrary code execution. 
+# For this local application, the risk is mitigated as the file is written and read by the
+# application itself on the user's machine. However, if this application were to be web-based
+# or require higher security (e.g., handling sensitive data or multi-user environments not
+# strictly local), this pickle-based session management would need to be replaced with more
+# robust and secure methods. Such methods could include:
+#   - Secure, http-only cookies with random session tokens.
+#   - Server-side session management with encrypted session data.
+#   - Use of industry-standard authentication libraries or frameworks.
 class UserSessionManager:
 	def __init__(self, app):
 		self.app = app
@@ -200,7 +220,10 @@ class UserSessionManager:
 		# loggedInUser is none because we are logging out the user
 		self.loggedInUser = None
 		# Remove the login authentication token because we are logging out the user
-		os.remove('last_user.pkl')
+		# Use config for pickle file path
+		pickle_path = os.path.join(PROJECT_ROOT, LAST_USER_PICKLE_FILE)
+		if os.path.exists(pickle_path):
+			os.remove(pickle_path)
 		
 		# Wipe currentStory and reset booleans for the new user. This is so the new user starts on a blank slate
 		self.app.unsavedStoryMessages = [] 
@@ -229,20 +252,23 @@ class UserSessionManager:
    
 	def checkForPrevUser(self):
 		try:
-			if os.path.exists('last_user.pkl'):
-				with open('last_user.pkl', 'rb') as f:
+			# Use config for pickle file path
+			pickle_path = os.path.join(PROJECT_ROOT, LAST_USER_PICKLE_FILE)
+			if os.path.exists(pickle_path):
+				with open(pickle_path, 'rb') as f:
 					last_username = pickle.load(f) # Now you can use `last_username` to log in
-					last_User = self.app.session.query(User).filter_by(username=last_username).first()
+					# Use the new service function to get the user
+					last_User = get_user_by_username(last_username)
 					if last_User:
 						self.saveLoginAs(last_User, last_username)
 			else:
 				# If no previous user found or the previosly logged in user logged out, direct them to the login page
 				self.app.openPage("userLoginPage")
 		except (OSError, IOError, pickle.UnpicklingError) as e:
-			print(f"Error reading 'last_user.pkl': {e}")
+			print(f"Error reading '{LAST_USER_PICKLE_FILE}': {e}")
 			# Handle error or fallback
 		except Exception as e:
-			print(f"Unexpected error: {e}")
+			print(f"Unexpected error checking for previous user: {e}")
 			# Handle unexpected exceptions
 
 class ThemeManager:
@@ -269,11 +295,13 @@ class App(ctk.CTk):
 		# Initialize window and resize it based on the user's viewport width and height
 		super().__init__()
 		self.title("BookSmart.Ai")
-		self.iconbitmap(r'assets\images\BookSmartLogo.ico')
+		# Use config for icon path
+		self.iconbitmap(os.path.join(PROJECT_ROOT, IMAGES_SUBDIRECTORY, ICON_FILE))
 		self.width = self.winfo_screenwidth()
 		self.geometry(f"{self.width}x{self.winfo_screenheight()}")
 		# AI model class instance that's going to be used throughout the application
-		self.image_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets/images")
+		# Use config for image_path
+		self.image_path = os.path.join(PROJECT_ROOT, IMAGES_SUBDIRECTORY)
 		self.storyGPT = StoryGPT()
 
 		'''
@@ -311,22 +339,17 @@ class App(ctk.CTk):
 			is light theme color, while value in right tuple 
 			is dark theme color
 		'''
-		self.theme = {
-			"main_clr": ("#E9EDEF", "#030712"),
-			"sub_clr": ("#9ca3af", "#0f172a"),
-			"label_clr": ("#000000", "#FFFFFF"),
-			"btn_clr": ("#4267B2", "#9ca3af"),
-			"btn_text_clr": "#FFFFFF",
-			"hover_clr": ("#34d399", "#4267B2"),
-			"entry_clr": ("#FFFFFF", "#374151"),
-			"entry_text_clr": ("#000000", "#FFFFFF"),
-		}
-		self.isDarkTheme = True
+		# Use theme from config
+		self.theme = THEME_COLORS
+		# self.isDarkTheme is removed from App class as ThemeManager handles its own theme state.
 	
-		# Engine and session constructor that we're going to use 
-		self.engine = create_engine("sqlite:///assets/PyProject.db")
-		self.Session = sessionmaker(bind=self.engine)
-		self.session = self.Session()
+		# self.engine and self.session are no longer initialized here
+		# as UserSessionManager now uses get_user_by_username,
+		# and no other App methods directly use the session.
+		# If other components need DB access, they should call get_session()
+		# or use a relevant service function.
+		self.engine = db_engine # Retained for now if any page relies on app.engine
+		                         # TODO: Audit and remove if app.engine is not used by pages
 
 		# Apply theme of application
 		self.themeManager.applyTheme()
@@ -369,7 +392,7 @@ class App(ctk.CTk):
 	1. pageName: The name of the class for the page that's being opened
 	'''  
 	def openPage(self, pageName, *args):
-		pageClass = self.getPageLazy(pageName)
+		pageClass = self.getPageLazy(pageName) # pageClass is now the constructor for the page
 		if not pageClass:
 			return
 		
@@ -377,7 +400,10 @@ class App(ctk.CTk):
 		# We pageClass to create the tkinter frame, and pass in self (App class), and any potential arguments
 		if self.currentPage:
 			self.currentPage.destroy()
-		self.currentPage = pageClass(self, *args)
+		
+		# Create an instance of the page, passing 'self' (the App instance)
+		# The page's __init__ method will receive 'self' as 'master' or 'app_instance'
+		self.currentPage = pageClass(self, *args) 
   
 		# Pack the new page on the screen
 		self.currentPage.pack(fill="both", expand=True)
